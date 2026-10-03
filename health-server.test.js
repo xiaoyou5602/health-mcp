@@ -6,7 +6,7 @@ const path = require("node:path");
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js");
 
-const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, mergeHealthData, normalizeSleepSession, readHealthRecords, storeCycleConfig } = require("./health-server");
+const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, formatLocalDate, mergeHealthData, normalizeSleepSession, readHealthRecords, storeCycleConfig } = require("./health-server");
 
 function tmpDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "health-mcp-test-"));
@@ -24,6 +24,31 @@ function night(endHour, durationHours) {
     session_end_time: `2026-09-02T${String(endHour).padStart(2, "0")}:00:00+08:00`,
     duration_seconds: durationHours * 3600,
     stages: [],
+  };
+}
+
+function workout(overrides = {}) {
+  const startTime = overrides.start_time || "2026-09-02T09:00:00+08:00";
+  const rawType = overrides.raw_type ?? 3;
+  const activityKind = overrides.activity_kind ?? 128;
+  const localId = overrides.local_id ?? 42;
+  const startSeconds = Date.parse(startTime) / 1000;
+  return {
+    id: `gbw1:${localId}:${startSeconds}:${rawType}:${activityKind}`,
+    raw_type: rawType,
+    activity_kind: activityKind,
+    start_time: startTime,
+    end_time: "2026-09-02T09:45:00+08:00",
+    timezone: "Asia/Shanghai",
+    captured_at: "2026-09-02T10:00:00+08:00",
+    active_seconds: 1800,
+    total_seconds: 2400,
+    distance_meters: 6789,
+    active_calories: 123,
+    average_heart_rate: 111,
+    min_heart_rate: 77,
+    max_heart_rate: 155,
+    ...overrides,
   };
 }
 
@@ -75,16 +100,92 @@ test("a file left duplicated by the old merge heals on the next upload", () => {
   assert.equal(record.sleep.duration_min, 480);
 });
 
+test("workout summaries are saved with an explicit privacy allowlist", () => {
+  const dir = tmpDataDir();
+  mergeHealthData(dir, {
+    date: "2026-09-02",
+    steps: { total: 4321 },
+    workouts: [workout({ route: [[31.2, 121.5]], device_address: "private", name: "private title" })],
+  });
+
+  const record = readDay(dir, "2026-09-02");
+  assert.equal(record.steps.total, 4321);
+  assert.equal(record.workouts.length, 1);
+  assert.deepEqual(Object.keys(record.workouts[0]), [
+    "id", "raw_type", "activity_kind", "start_time", "end_time", "timezone", "captured_at",
+    "active_seconds", "total_seconds", "distance_meters", "active_calories",
+    "average_heart_rate", "min_heart_rate", "max_heart_rate",
+  ]);
+  assert.equal(record.workouts[0].route, undefined);
+  assert.equal(record.workouts[0].device_address, undefined);
+  assert.equal(record.workouts[0].name, undefined);
+});
+
+test("workout re-sends update by stable id while malformed rows stay isolated", () => {
+  const dir = tmpDataDir();
+  const original = workout();
+  mergeHealthData(dir, { date: "2026-09-02", workouts: [original] });
+  mergeHealthData(dir, {
+    date: "2026-09-02",
+    heart_rate: [{ timestamp: "2026-09-02T10:05:00+08:00", bpm: 88 }],
+    workouts: [
+      { ...original, captured_at: "2026-09-02T10:10:00+08:00", active_calories: 124 },
+      workout({
+        local_id: 43,
+        start_time: "2026-09-02T11:00:00+08:00",
+        end_time: "2026-09-02T11:30:00+08:00",
+        captured_at: "2026-09-02T12:00:00+08:00",
+        active_seconds: 1700,
+        total_seconds: 1750,
+      }),
+      { ...workout({ local_id: 44 }), active_seconds: 999999 },
+      { ...workout({ local_id: 45 }), active_seconds: null },
+      { id: "not-a-workout" },
+    ],
+  });
+
+  const record = readDay(dir, "2026-09-02");
+  assert.equal(record.heart_rate.samples.length, 1, "legacy health data must survive malformed workouts");
+  assert.equal(record.workouts.length, 2);
+  assert.equal(record.workouts[0].active_calories, 124, "the latest valid copy replaces the stored id");
+  assert.equal(record.workouts[0].captured_at, "2026-09-02T10:10:00+08:00");
+  assert.equal(record.workouts[1].id.startsWith("gbw1:43:"), true);
+});
+
+test("null and zero workout values remain distinct and an all-invalid batch adds nothing", () => {
+  const dir = tmpDataDir();
+  mergeHealthData(dir, {
+    date: "2026-09-02",
+    steps: { total: 99 },
+    workouts: [workout({ total_seconds: null, distance_meters: null, active_calories: 0, average_heart_rate: null, min_heart_rate: null, max_heart_rate: null })],
+  });
+  let record = readDay(dir, "2026-09-02");
+  assert.equal(record.workouts[0].total_seconds, null);
+  assert.equal(record.workouts[0].distance_meters, null);
+  assert.equal(record.workouts[0].active_calories, 0);
+
+  mergeHealthData(dir, { date: "2026-09-03", steps: { total: 100 }, workouts: [{}, { id: "bad" }] });
+  record = readDay(dir, "2026-09-03");
+  assert.equal(record.steps.total, 100);
+  assert.equal(record.workouts, undefined);
+});
+
 test("MCP exposes the public health read contract and custom day ranges", async () => {
   const dir = tmpDataDir();
-  for (const [date, total] of [["2026-09-02", 2000], ["2026-09-03", 3000], ["2026-09-04", 4000], ["2026-09-05", 5000], ["2026-09-06", 6000]]) {
+  const today = new Date();
+  const dates = [4, 3, 2, 1, 0].map((daysAgo) => {
+    const date = new Date(today);
+    date.setDate(date.getDate() - daysAgo);
+    return formatLocalDate(date);
+  });
+  for (const [date, total] of dates.map((date, index) => [date, (index + 2) * 1000])) {
     mergeHealthData(dir, { date, type: "steps", data: { total } });
   }
-  mergeHealthData(dir, { date: "2026-09-06", heart_rate: [
-    { timestamp: "2026-09-06T00:10:00Z", bpm: 60, resting_bpm: 58 },
-    { timestamp: "2026-09-06T00:50:00Z", bpm: 80 },
+  mergeHealthData(dir, { date: dates.at(-1), heart_rate: [
+    { timestamp: `${dates.at(-1)}T00:10:00+08:00`, bpm: 60, resting_bpm: 58 },
+    { timestamp: `${dates.at(-1)}T00:50:00+08:00`, bpm: 80 },
   ], sleep: [{
-    session_start_time: "2026-09-05T15:30:00Z", session_end_time: "2026-09-05T23:30:00Z",
+    session_start_time: `${dates.at(-1)}T00:30:00+08:00`, session_end_time: `${dates.at(-1)}T08:30:00+08:00`,
     duration_seconds: 28800, stages: [],
   }] });
   const server = createHealthMcpServer(dir);
@@ -115,7 +216,7 @@ test("cycle endpoint stores and clears independent cycle context", async () => {
   let response = await fetch(`${base}/cycle`, { method: "POST", headers: { authorization: "Bearer 1234567890abcdef", "content-type": "application/json" }, body: JSON.stringify(config) });
   assert.equal(response.status, 200);
   mergeHealthData(dir, { date: "2026-09-05", type: "steps", data: { total: 100 } });
-  const result = require("./health-server").readHealthRecords(dir, 2, "all");
+  const result = readHealthRecords(dir, 2, "all", new Date("2026-09-05T12:00:00+08:00"));
   assert.deepEqual(result.find((record) => record.date === "2026-09-05").cycle, { period_day: 5, confirmed: true });
   response = await fetch(`${base}/cycle`, { method: "POST", headers: { authorization: "Bearer 1234567890abcdef", "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) });
   assert.equal(response.status, 200);

@@ -14,6 +14,8 @@ const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "daily_sum
 const TIME_RANGES = ["three_days", "today"];
 const HEART_RATE_DETAILS = ["daily", "hourly"];
 const MAX_READ_DAYS = 62;
+const MAX_WORKOUTS_PER_DAY = 128;
+const MAX_WORKOUT_SECONDS = 7 * 24 * 60 * 60;
 const TZ = process.env.HEALTH_TZ || "Asia/Shanghai";
 
 function formatLocalDate(date) {
@@ -209,6 +211,112 @@ function upsertSleepSession(sessions, incoming) {
   }
 }
 
+function normalizeWorkoutNumber(value, name, { integer = false, min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  if (value === null || value === undefined) return null;
+  const number = Number(value);
+  if (!Number.isFinite(number) || (integer && !Number.isSafeInteger(number)) || number < min || number > max) {
+    throw new Error(`${name} is invalid`);
+  }
+  return number;
+}
+
+function normalizeWorkoutTimestamp(value, name) {
+  if (typeof value !== "string" || value.length > 64 || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) {
+    throw new Error(`${name} must be an ISO 8601 timestamp with an offset`);
+  }
+  const millis = Date.parse(value);
+  if (!Number.isFinite(millis) || millis % 1000 !== 0) throw new Error(`${name} is invalid`);
+  return { text: value, millis };
+}
+
+function normalizeWorkoutSummary(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("workout must be an object");
+  if (typeof raw.id !== "string") throw new Error("workout id is invalid");
+  const identity = /^gbw1:([1-9]\d{0,14}):(-?\d+):(\d{1,3}):(\d+)$/.exec(raw.id);
+  if (!identity) throw new Error("workout id is invalid");
+
+  const localId = Number(identity[1]);
+  const identityStart = Number(identity[2]);
+  const identityRawType = Number(identity[3]);
+  const identityActivityKind = Number(identity[4]);
+  if (![localId, identityStart, identityRawType, identityActivityKind].every(Number.isSafeInteger)) {
+    throw new Error("workout id is invalid");
+  }
+
+  const rawType = normalizeWorkoutNumber(raw.raw_type, "raw_type", { integer: true, min: 0, max: 255 });
+  const activityKind = normalizeWorkoutNumber(raw.activity_kind, "activity_kind", { integer: true, min: 0, max: 2147483647 });
+  const start = normalizeWorkoutTimestamp(raw.start_time, "start_time");
+  const end = normalizeWorkoutTimestamp(raw.end_time, "end_time");
+  const captured = normalizeWorkoutTimestamp(raw.captured_at, "captured_at");
+  const timezone = typeof raw.timezone === "string" && /^[A-Za-z0-9_+./:-]{1,64}$/.test(raw.timezone)
+    ? raw.timezone : null;
+  if (!timezone) throw new Error("timezone is invalid");
+
+  const startSeconds = start.millis / 1000;
+  const elapsedSeconds = (end.millis - start.millis) / 1000;
+  if (identityStart !== startSeconds || identityRawType !== rawType || identityActivityKind !== activityKind) {
+    throw new Error("workout id does not match its fields");
+  }
+  if (!Number.isSafeInteger(elapsedSeconds) || elapsedSeconds < 1 || elapsedSeconds > MAX_WORKOUT_SECONDS || captured.millis < end.millis) {
+    throw new Error("workout timestamps are invalid");
+  }
+
+  const activeSeconds = normalizeWorkoutNumber(raw.active_seconds, "active_seconds", { integer: true, min: 0, max: elapsedSeconds });
+  if (activeSeconds === null) throw new Error("active_seconds is required");
+  const totalSeconds = normalizeWorkoutNumber(raw.total_seconds, "total_seconds", { integer: true, min: activeSeconds, max: elapsedSeconds });
+  const distanceMeters = normalizeWorkoutNumber(raw.distance_meters, "distance_meters", { max: 10000000 });
+  const activeCalories = normalizeWorkoutNumber(raw.active_calories, "active_calories", { max: 10000000 });
+  const averageHeartRate = normalizeWorkoutNumber(raw.average_heart_rate, "average_heart_rate", { integer: true, min: 1, max: 300 });
+  const minHeartRate = normalizeWorkoutNumber(raw.min_heart_rate, "min_heart_rate", { integer: true, min: 1, max: 300 });
+  const maxHeartRate = normalizeWorkoutNumber(raw.max_heart_rate, "max_heart_rate", { integer: true, min: 1, max: 300 });
+  if ([averageHeartRate, minHeartRate, maxHeartRate].includes(255)) throw new Error("heart rate is invalid");
+  if (minHeartRate !== null && maxHeartRate !== null && minHeartRate > maxHeartRate) throw new Error("heart rate range is invalid");
+  if (averageHeartRate !== null && ((minHeartRate !== null && averageHeartRate < minHeartRate) || (maxHeartRate !== null && averageHeartRate > maxHeartRate))) {
+    throw new Error("average heart rate is outside its range");
+  }
+
+  return {
+    id: raw.id,
+    raw_type: rawType,
+    activity_kind: activityKind,
+    start_time: start.text,
+    end_time: end.text,
+    timezone,
+    captured_at: captured.text,
+    active_seconds: activeSeconds,
+    total_seconds: totalSeconds,
+    distance_meters: distanceMeters,
+    active_calories: activeCalories,
+    average_heart_rate: averageHeartRate,
+    min_heart_rate: minHeartRate,
+    max_heart_rate: maxHeartRate,
+  };
+}
+
+function mergeWorkoutSummaries(stored, incoming) {
+  const workouts = [];
+  const positions = new Map();
+  const keep = (raw, replace) => {
+    let normalized;
+    try {
+      normalized = normalizeWorkoutSummary(raw);
+    } catch {
+      return;
+    }
+    const position = positions.get(normalized.id);
+    if (position !== undefined) {
+      if (replace) workouts[position] = normalized;
+      return;
+    }
+    if (workouts.length >= MAX_WORKOUTS_PER_DAY) return;
+    positions.set(normalized.id, workouts.length);
+    workouts.push(normalized);
+  };
+  for (const workout of Array.isArray(stored) ? stored : []) keep(workout, false);
+  for (const workout of incoming) keep(workout, true);
+  return workouts.sort((a, b) => a.start_time.localeCompare(b.start_time) || a.id.localeCompare(b.id));
+}
+
 function mergeSleepSessionsForDate(dataDir, date, incoming, updatedAt) {
   const filePath = recordPath(dataDir, date);
   const record = readRecord(filePath, { date });
@@ -291,6 +399,12 @@ function mergeHealthData(dataDir, body) {
     const bpms = current.heart_rate.samples.map((sample) => sample.bpm).filter((bpm) => bpm > 0);
     if (bpms.length) current.heart_rate.avg = Math.round(bpms.reduce((sum, bpm) => sum + bpm, 0) / bpms.length);
     current.heart_rate.updatedAt = now;
+  }
+
+  if (Array.isArray(body.workouts)) {
+    const workouts = mergeWorkoutSummaries(current.workouts, body.workouts);
+    if (workouts.length) current.workouts = workouts;
+    else delete current.workouts;
   }
 
   for (const caloriesType of ["active_calories", "total_calories"]) {
