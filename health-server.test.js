@@ -196,6 +196,12 @@ test("MCP exposes the public health read contract and custom day ranges", async 
   const tools = await client.listTools();
   assert.deepEqual(tools.tools.map((tool) => tool.name), ["health_read"]);
   assert.deepEqual(Object.keys(tools.tools[0].inputSchema.properties), ["data_type", "time_range", "heart_rate_detail", "days"]);
+  assert.equal(tools.tools[0].description, "读取健康数据：当前状态、步数、心率、睡眠、运动摘要、每日摘要或完整数据。");
+  const properties = tools.tools[0].inputSchema.properties;
+  assert.match(properties.data_type.description, /省略时为当前状态/);
+  assert.match(properties.time_range.description, /today.*three_days/);
+  assert.match(properties.heart_rate_detail.description, /仅用于 heart_rate/);
+  assert.match(properties.days.description, /优先于 time_range.*不用于 current_status/);
   const steps = JSON.parse((await client.callTool({ name: "health_read", arguments: { data_type: "steps", days: 5 } })).content[0].text);
   assert.equal(steps.summaries.length, 5);
   const hourly = JSON.parse((await client.callTool({ name: "health_read", arguments: { data_type: "heart_rate", heart_rate_detail: "hourly", time_range: "today" } })).content[0].text);

@@ -600,11 +600,11 @@ function buildSummaryText(records) {
 
 function createHealthMcpServer(dataDir) {
   const server = new McpServer({ name: "health", version: "1.1.0" });
-  server.tool("health_read", "读取健康数据：当前状态、步数、心率、睡眠、运动摘要、每日摘要或完整数据。运动摘要使用 data_type=workouts，也包含在 all 中。", {
-    data_type: z.enum(DATA_TYPES).optional(),
-    time_range: z.enum(TIME_RANGES).optional(),
-    heart_rate_detail: z.enum(HEART_RATE_DETAILS).optional(),
-    days: z.number().int().min(1).max(MAX_READ_DAYS).optional(),
+  server.tool("health_read", "读取健康数据：当前状态、步数、心率、睡眠、运动摘要、每日摘要或完整数据。", {
+    data_type: z.enum(DATA_TYPES).optional().describe("读取类别；省略时为当前状态。"),
+    time_range: z.enum(TIME_RANGES).optional().describe("today 为今天，three_days 为最近三天；省略时为最近三天。"),
+    heart_rate_detail: z.enum(HEART_RATE_DETAILS).optional().describe("仅用于 heart_rate：daily 为每日统计，hourly 附加每小时统计；省略时为 daily。"),
+    days: z.number().int().min(1).max(MAX_READ_DAYS).optional().describe("读取最近几天（1～62），优先于 time_range；不用于 current_status。"),
   }, async (args) => ({
     content: [{ type: "text", text: JSON.stringify(readHealthToolResult(dataDir, args), null, 2) }],
   }));
