@@ -206,6 +206,65 @@ test("MCP exposes the public health read contract and custom day ranges", async 
   await server.close();
 });
 
+test("MCP reads saved workouts with day ranges, latest-first order and allowlisted fields", async (t) => {
+  const dir = tmpDataDir();
+  const today = formatLocalDate(new Date());
+  const yesterday = formatLocalDate(new Date(Date.now() - 86400000));
+  const make = (date, localId) => workout({ local_id: localId, start_time: `${date}T09:00:00+08:00`,
+    end_time: `${date}T09:45:00+08:00`, captured_at: `${date}T10:00:00+08:00` });
+  mergeHealthData(dir, { date: yesterday, workouts: [make(yesterday, 1)] });
+  mergeHealthData(dir, { date: today, steps: { total: 456 }, workouts: [make(today, 2)] });
+  const file = path.join(dir, `${today}.json`);
+  const stored = readDay(dir, today);
+  stored.workouts[0].route = [[1, 2]];
+  stored.workouts[0].name = "private title";
+  stored.workouts.push({ id: "bad" });
+  fs.writeFileSync(file, JSON.stringify(stored));
+  const before = fs.readFileSync(file, "utf8");
+  const server = createHealthMcpServer(dir);
+  const client = new Client({ name: "workout-read-test", version: "1" }, { capabilities: {} });
+  t.after(async () => { await client.close(); await server.close(); });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  const tools = await client.listTools();
+  assert.ok(tools.tools[0].inputSchema.properties.data_type.enum.includes("workouts"));
+  const call = async (args) => JSON.parse((await client.callTool({ name: "health_read", arguments: args })).content[0].text);
+  const one = await call({ data_type: "workouts", time_range: "today" });
+  assert.equal(one.data_type, "workouts");
+  assert.equal(one.days, 1);
+  assert.equal(one.workouts.length, 1);
+  assert.equal(one.workouts[0].route, undefined);
+  assert.equal(one.workouts[0].name, undefined);
+  assert.equal(one.workouts[0].active_seconds, 1800);
+  const two = await call({ data_type: "workouts", days: 2, time_range: "today" });
+  assert.deepEqual(two.workouts.map((row) => row.date), [today, yesterday]);
+  assert.equal(two.time_range, "custom");
+  const all = await call({ data_type: "all", days: 2 });
+  assert.deepEqual(all.workouts, two.workouts);
+  assert.equal(all.today_steps, 456);
+  assert.equal(fs.readFileSync(file, "utf8"), before, "reads must not rewrite stored history");
+});
+
+test("MCP returns an empty workout list for missing or malformed legacy collections", async (t) => {
+  const dir = tmpDataDir();
+  const today = formatLocalDate(new Date());
+  fs.writeFileSync(path.join(dir, `${today}.json`), JSON.stringify({ date: today, workouts: { bad: true } }));
+  const server = createHealthMcpServer(dir);
+  const client = new Client({ name: "empty-workout-test", version: "1" }, { capabilities: {} });
+  t.after(async () => { await client.close(); await server.close(); });
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  await server.connect(st);
+  await client.connect(ct);
+  for (const data_type of ["workouts", "all"]) {
+    const result = await client.callTool({ name: "health_read", arguments: { data_type, days: 62 } });
+    assert.deepEqual(JSON.parse(result.content[0].text).workouts, []);
+  }
+  fs.writeFileSync(path.join(dir, `${today}.json`), JSON.stringify({ date: today, steps: { total: 0 } }));
+  const result = await client.callTool({ name: "health_read", arguments: { data_type: "workouts" } });
+  assert.deepEqual(JSON.parse(result.content[0].text).workouts, []);
+});
+
 test("cycle endpoint stores and clears independent cycle context", async () => {
   const dir = tmpDataDir();
   const app = createApp({ dataDir: dir, ingestToken: "1234567890abcdef" });

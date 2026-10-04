@@ -10,7 +10,7 @@ const { buildAllowedHosts, installRequestObservability, mountMcpEndpoint } = req
 
 const DEFAULT_DATA_DIR = "/var/lib/health-mcp";
 const VALID_TYPES = new Set(["steps", "heart_rate", "sleep", "all"]);
-const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "daily_summary", "all"];
+const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "workouts", "daily_summary", "all"];
 const TIME_RANGES = ["three_days", "today"];
 const HEART_RATE_DETAILS = ["daily", "hourly"];
 const MAX_READ_DAYS = 62;
@@ -539,6 +539,12 @@ function hourlyHeartRateSummaries(records) {
   return [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([hour, values]) => ({ hour, hr_max: Math.max(...values), hr_min: Math.min(...values), hr_avg: Math.round(values.reduce((sum, value) => sum + value, 0) / values.length), sample_count: values.length }));
 }
 
+function workoutSummaries(records) {
+  return records.flatMap((record) => mergeWorkoutSummaries([], Array.isArray(record.workouts) ? record.workouts : [])
+    .map((workout) => ({ date: record.date, ...workout })))
+    .sort((a, b) => b.start_time.localeCompare(a.start_time) || a.id.localeCompare(b.id));
+}
+
 function parseHealthToolRequest(args = {}) {
   const dataType = DATA_TYPES.includes(args.data_type) ? args.data_type : "current_status";
   const customDays = Number.isSafeInteger(args.days) && args.days >= 1 && args.days <= MAX_READ_DAYS ? args.days : null;
@@ -563,8 +569,9 @@ function readHealthToolResult(dataDir, args = {}) {
     return args.heart_rate_detail === "hourly" ? { ...result, detail: "hourly", hourly_summaries: hourlyHeartRateSummaries(records) } : result;
   }
   if (dataType === "sleep") return withCycle({ ...range, recent_sleep_list: sleep });
+  if (dataType === "workouts") return withCycle({ ...range, workouts: workoutSummaries(records) });
   if (dataType === "daily_summary") return withCycle({ ...range, summaries });
-  return withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: nullableNumber(todayRecord.spo2 ?? todayRecord.blood_oxygen), stress: nullableNumber(todayRecord.stress), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, summaries });
+  return withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: nullableNumber(todayRecord.spo2 ?? todayRecord.blood_oxygen), stress: nullableNumber(todayRecord.stress), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, workouts: workoutSummaries(records), summaries });
 }
 
 function buildSummaryText(records) {
@@ -593,7 +600,7 @@ function buildSummaryText(records) {
 
 function createHealthMcpServer(dataDir) {
   const server = new McpServer({ name: "health", version: "1.1.0" });
-  server.tool("health_read", "读取健康数据：当前状态、步数、心率、睡眠、每日摘要或完整数据。", {
+  server.tool("health_read", "读取健康数据：当前状态、步数、心率、睡眠、运动摘要、每日摘要或完整数据。运动摘要使用 data_type=workouts，也包含在 all 中。", {
     data_type: z.enum(DATA_TYPES).optional(),
     time_range: z.enum(TIME_RANGES).optional(),
     heart_rate_detail: z.enum(HEART_RATE_DETAILS).optional(),
