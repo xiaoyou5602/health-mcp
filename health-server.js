@@ -7,10 +7,11 @@ const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { hostHeaderValidation } = require("@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js");
 const { z } = require("zod");
 const { buildAllowedHosts, installRequestObservability, mountMcpEndpoint } = require("./shared/http-runtime");
+const { normalizeSleepHrv, mergeSleepHrv } = require("./shared/sleep-hrv");
 
 const DEFAULT_DATA_DIR = "/var/lib/health-mcp";
-const VALID_TYPES = new Set(["steps", "heart_rate", "sleep", "all"]);
-const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "workouts", "daily_summary", "all"];
+const VALID_TYPES = new Set(["steps", "heart_rate", "sleep", "sleep_hrv", "all"]);
+const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "sleep_hrv", "workouts", "daily_summary", "all"];
 const TIME_RANGES = ["three_days", "today"];
 const HEART_RATE_DETAILS = ["daily", "hourly"];
 const MAX_READ_DAYS = 62;
@@ -367,6 +368,23 @@ function mergeHealthData(dataDir, body) {
     }
   }
 
+  // Group by wake-up date, independently of the ordinary sleep-session upload cursor.
+  if (Array.isArray(body.sleep_hrv)) {
+    for (const raw of body.sleep_hrv.slice(0, 128)) {
+      const summary = normalizeSleepHrv(raw);
+      if (!summary) continue;
+      const hrvDate = formatLocalDate(new Date(summary.sleep_end));
+      if (hrvDate === date) {
+        current.sleep_hrv = mergeSleepHrv(current.sleep_hrv, summary);
+      } else {
+        const hrvPath = recordPath(dataDir, hrvDate);
+        const record = readRecord(hrvPath, { date: hrvDate });
+        record.sleep_hrv = mergeSleepHrv(record.sleep_hrv, summary);
+        writeRecordAtomic(hrvPath, record);
+      }
+    }
+  }
+
   if (type === "steps" || body.steps !== undefined) {
     let newTotal = 0;
     if (Array.isArray(body.steps)) {
@@ -491,6 +509,7 @@ function heartRateSummary(record) {
 function dailySummary(record) {
   return {
     date: record.date,
+    sleep_hrv: normalizeSleepHrv(record.sleep_hrv),
     steps: nullableNumber(record?.steps?.total),
     calories: nullableNumber(record?.active_calories?.total ?? record?.total_calories?.total),
     ...heartRateSummary(record),
@@ -559,19 +578,23 @@ function readHealthToolResult(dataDir, args = {}) {
   const summaries = records.map(dailySummary).sort((a, b) => a.date.localeCompare(b.date));
   const todayRecord = records.find((record) => record.date === today) || {};
   const sleep = sleepSessions(records);
+  const sleepHrv = records.map((record) => ({ date: record.date, value: normalizeSleepHrv(record.sleep_hrv) }))
+    .filter((record) => record.value).map((record) => ({ date: record.date, ...record.value }))
+    .sort((a, b) => Date.parse(b.sleep_end) - Date.parse(a.sleep_end));
   const resultBase = { success: true, data_type: dataType };
   const withCycle = (result) => todayRecord.cycle ? { ...result, cycle: todayRecord.cycle } : result;
-  if (dataType === "current_status") return withCycle({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, heart_rate: latestSample(todayRecord), spo2: nullableNumber(todayRecord.spo2 ?? todayRecord.blood_oxygen), stress: nullableNumber(todayRecord.stress), latest_sleep: sleep[0] || null });
+  if (dataType === "current_status") return withCycle({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, heart_rate: latestSample(todayRecord), spo2: nullableNumber(todayRecord.spo2 ?? todayRecord.blood_oxygen), stress: nullableNumber(todayRecord.stress), latest_sleep: sleep[0] || null, latest_sleep_hrv: sleepHrv[0] || null });
   const range = { ...resultBase, time_range: timeRange, days };
+  if (dataType === "sleep_hrv") return withCycle({ ...range, sleep_hrv: sleepHrv });
   if (dataType === "steps") return withCycle({ ...range, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, summaries: summaries.map(({ date, steps, calories }) => ({ date, steps, calories })) });
   if (dataType === "heart_rate") {
     const result = withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, daily_summaries: summaries.map(({ date, hr_max, hr_min, hr_avg, hr_resting }) => ({ date, hr_max, hr_min, hr_avg, hr_resting })) });
     return args.heart_rate_detail === "hourly" ? { ...result, detail: "hourly", hourly_summaries: hourlyHeartRateSummaries(records) } : result;
   }
-  if (dataType === "sleep") return withCycle({ ...range, recent_sleep_list: sleep });
+  if (dataType === "sleep") return withCycle({ ...range, recent_sleep_list: sleep, sleep_hrv: sleepHrv });
   if (dataType === "workouts") return withCycle({ ...range, workouts: workoutSummaries(records) });
   if (dataType === "daily_summary") return withCycle({ ...range, summaries });
-  return withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: nullableNumber(todayRecord.spo2 ?? todayRecord.blood_oxygen), stress: nullableNumber(todayRecord.stress), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, workouts: workoutSummaries(records), summaries });
+  return withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: nullableNumber(todayRecord.spo2 ?? todayRecord.blood_oxygen), stress: nullableNumber(todayRecord.stress), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, sleep_hrv: sleepHrv, workouts: workoutSummaries(records), summaries });
 }
 
 function buildSummaryText(records) {

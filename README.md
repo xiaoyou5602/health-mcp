@@ -55,7 +55,7 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 
 服务只暴露一个 `health_read` 工具：
 
-- `data_type`：`current_status`、`steps`、`heart_rate`、`sleep`、`workouts`、`daily_summary`、`all`
+- `data_type`：`current_status`、`steps`、`heart_rate`、`sleep`、`sleep_hrv`、`workouts`、`daily_summary`、`all`
 - `time_range`：`today` 或 `three_days`
 - `days`：除 `current_status` 外可自定义读取 1～62 天；传入后优先于 `time_range`
 - `heart_rate_detail`：仅用于 `heart_rate`，可选 `daily` 或 `hourly`；小时模式只返回每小时统计，不返回原始样本
@@ -68,6 +68,14 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 运动与总时长（秒）、距离（米）、活动卡路里和平均/最低/最高心率；缺失数值为 `null`，
 没有记录时返回空数组。`all` 的 `workouts` 使用相同字段与时间范围。
 
+查询睡眠 HRV：`health_read({"data_type":"sleep_hrv","days":14})`。结果的 `sleep_hrv`
+按醒来时间从新到旧排列，包含醒来日期 `date`、来源 `source`、入睡和醒来时间
+`sleep_start` / `sleep_end`、睡眠平均值 `average_ms`、基线界限
+`baseline_lower_ms` / `baseline_upper_ms` 和采集时间 `captured_at`。
+缺少基线时返回 `null`，没有记录时返回空数组。`sleep` 和 `all` 也包含此数组，
+每日摘要包含当天的 `sleep_hrv`，当前状态包含最近三天内的 `latest_sleep_hrv`。
+这些是手环每晚汇总，不包含分时 HRV、5 分钟最高值或恢复状态。
+
 经期配置使用上传门锁调用 `POST /cycle`，请求体包含 `enabled`、`last_start`、
 `cycle_length_days`、`cycle_period_days`，以及可选的 `last_confirmed`。关闭时发送 `{ "enabled": false }`，
 服务会删除独立的 `cycle.json`，不会写入每日健康记录。
@@ -79,6 +87,19 @@ MCP 入口 `https://你的域名/mcp`（Streamable HTTP）。若设了读取 tok
 按天落盘为 `<HEALTH_DATA_DIR>/YYYY-MM-DD.json`。同一天重复上传自动合并：步数取较大值、心率按时间戳去重、睡眠 session 按时间跨度合并，运动摘要按稳定 `id` 更新。所以重复上传或手动补传历史都不会把数据搞乱。
 
 运动摘要由配套 App 独立选择是否上传。服务端只保存约定的摘要字段，不保存路线、位置、设备地址或自由文本；单条异常记录会被跳过，不影响同批其他运动或原有健康数据。原始 HTTP 读取接口的 `type=all` 会返回已经保存的 `workouts`，MCP 通过 `data_type=workouts` 或 `all` 读取。
+
+睡眠 HRV 由每日上传体的可选 `sleep_hrv` 数组接收，目前支持来源
+`huawei_sleep_statistics`。时间字段需为含时区的 ISO 8601 字符串，平均值为 1～200
+的整数毫秒数；缺失或无效基线保存为 `null`。服务按 `HEALTH_TZ` 的醒来日期归属，
+每天保留醒来时间最新的一条，同醒来时间按采集时间更新。无效新值和普通健康上传
+不会清除已有 HRV，非约定字段不会保存。
+
+需搭配支持睡眠 HRV 上传的 App，见
+[手机端 sleep-hrv 分支说明](https://github.com/wuyu202444/band-health-sync/blob/sleep-hrv/docs/sleep-hrv.md)。
+先更新后端再安装新版 App，以便首次历史补传能够保存。旧 App 可继续上传原有数据。
+
+运行 `npm ci`、`npm run check` 和 `npm test` 可验证服务；HRV 回归测试使用合成数据，
+覆盖跨午夜归属、与睡眠同时合并、重复上传、无效值隔离和 MCP 读取。
 
 ## 许可
 
