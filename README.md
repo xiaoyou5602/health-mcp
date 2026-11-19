@@ -61,24 +61,13 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 - `heart_rate_detail`：仅用于 `heart_rate`，可选 `daily` 或 `hourly`；小时模式只返回每小时统计，不返回原始样本
 
 不传参数时返回紧凑的当前状态。`daily_summary` 每天包含步数、卡路里、心率、血氧、压力和睡眠摘要；
-`all` 还会附带睡眠明细与运动摘要。读取结果可能附带 `cycle` 经期上下文。
-
-查询运动摘要：`health_read({"data_type":"workouts","days":7})`。结果的 `workouts` 按开始时间
-从新到旧排列，每条包含归属日期 `date`、稳定 ID、运动类型编码、起止时间、时区、采集时间、
-运动与总时长（秒）、距离（米）、活动卡路里和平均/最低/最高心率；缺失数值为 `null`，
-没有记录时返回空数组。`all` 的 `workouts` 使用相同字段与时间范围。
-
-经期配置使用上传门锁调用 `POST /cycle`，请求体包含 `enabled`、`last_start`、
-`cycle_length_days`、`cycle_period_days`，以及可选的 `last_confirmed`。关闭时发送 `{ "enabled": false }`，
-服务会删除独立的 `cycle.json`，不会写入每日健康记录。
+`all` 还会附带睡眠明细与运动摘要。读取结果可选附带 `cycle` 经期上下文。
 
 MCP 入口 `https://你的域名/mcp`（Streamable HTTP）。若设了读取 token，客户端请求头需加 `Authorization: Bearer <读取token>`。
 
 ## 数据
 
 按天落盘为 `<HEALTH_DATA_DIR>/YYYY-MM-DD.json`。同一天重复上传自动合并：步数取较大值、心率按时间戳去重、睡眠 session 按时间跨度合并，运动摘要按稳定 `id` 更新。所以重复上传或手动补传历史都不会把数据搞乱。
-
-运动摘要由配套 App 独立选择是否上传。服务端只保存约定的摘要字段，不保存路线、位置、设备地址或自由文本；单条异常记录会被跳过，不影响同批其他运动或原有健康数据。原始 HTTP 读取接口的 `type=all` 会返回已经保存的 `workouts`，MCP 通过 `data_type=workouts` 或 `all` 读取。
 
 ## 许可
 
